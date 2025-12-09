@@ -69,23 +69,45 @@ class Table:
     unit_tests: List[Dict] = field(default_factory=list)
 
     @staticmethod
-    def from_node(node, manifest: Manifest) -> Table:
-        unique_id = node["unique_id"]
+    def from_node(node, manifest: Manifest) -> Optional[Table]:
+        unique_id = node.get("unique_id")
+        if not unique_id:
+            logging.warning("Skipping table node - missing unique_id")
+            return None
+
         manifest_table = manifest.get_table(unique_id)
         if manifest_table is None:
-            raise ValueError(f"Unique ID {unique_id} not found in manifest.json")
-        columns = [Column.from_node(col) for col in node["columns"].values()]
-        original_file_path = manifest_table["original_file_path"]
+            # Skip 3rd party package tables that are in catalog.json but not in manifest.json
+            logging.debug(
+                "Skipping table %s - not found in manifest.json (likely a 3rd party package table)",
+                unique_id,
+            )
+            return None
+
+        # Safely access columns
+        node_columns = node.get("columns", {})
+        if not node_columns:
+            logging.debug("Skipping table %s - no columns found in catalog", unique_id)
+            return None
+
+        columns = [Column.from_node(col) for col in node_columns.values()]
+        original_file_path = manifest_table.get("original_file_path")
 
         if original_file_path is None:
             logging.warning("original_file_path value not found in manifest for %s", unique_id)
+
+        # Safely access name from manifest
+        manifest_name = manifest_table.get("name", "")
+        if not manifest_name:
+            logging.warning("name not found in manifest for %s", unique_id)
+            return None
 
         return Table(
             unique_id,
             # Take table name from manifest.json instead of catalog.json since in catalog.json the
             # name is actually an alias in case it is defined.
-            manifest_table["name"].lower(),
-            original_file_path,
+            manifest_name.lower(),
+            original_file_path or "",
             {col.name: col for col in columns},
         )
 
@@ -148,7 +170,21 @@ class Catalog:
 
     @staticmethod
     def from_nodes(nodes, manifest: Manifest):
-        tables = [Table.from_node(table, manifest) for table in nodes]
+        tables = []
+        skipped_count = 0
+        for node in nodes:
+            table = Table.from_node(node, manifest)
+            if table is not None:
+                tables.append(table)
+            else:
+                skipped_count += 1
+
+        if skipped_count > 0:
+            logging.info(
+                "Skipped %d table(s) not found in manifest.json (likely 3rd party package tables)",
+                skipped_count,
+            )
+
         return Catalog({table.unique_id: table for table in tables})
 
     def get_table(self, table_id):
@@ -251,7 +287,8 @@ class Manifest:
             if node["resource_type"] != "test" or "test_metadata" not in node:
                 continue
 
-            depends_on = node["depends_on"]["nodes"]
+            # Safely access depends_on
+            depends_on = node.get("depends_on", {}).get("nodes", [])
             if not depends_on:
                 continue
 
@@ -260,11 +297,10 @@ class Manifest:
             else:
                 table_id = depends_on[0]
 
-            column_name = (
-                node.get("column_name")
-                or node["test_metadata"]["kwargs"].get("column_name")
-                or node["test_metadata"]["kwargs"].get("arg")
-            )
+            # Safely access kwargs
+            test_metadata = node.get("test_metadata", {})
+            kwargs = test_metadata.get("kwargs", {})
+            column_name = node.get("column_name") or kwargs.get("column_name") or kwargs.get("arg")
             if not column_name:
                 continue
 
@@ -284,8 +320,15 @@ class Manifest:
             if node["resource_type"] != "unit_test":
                 continue
 
-            depends_on = node["depends_on"]["nodes"]
-            if not depends_on:
+            # Safely access depends_on
+            depends_on = node.get("depends_on", {}).get("nodes", [])
+            if not depends_on or len(depends_on) != 1:
+                # Skip if no dependencies or more/less than 1 (unit tests should have exactly 1)
+                logging.debug(
+                    "Skipping unit test %s - expected exactly 1 dependency, got %d",
+                    node.get("unique_id", "unknown"),
+                    len(depends_on),
+                )
                 continue
 
             [table_id] = depends_on  # There should only be one model
@@ -295,13 +338,18 @@ class Manifest:
 
     @staticmethod
     def _full_table_name(table):
-        return f"{table['schema']}.{table['name']}".lower()
+        schema = table.get("schema", "")
+        name = table.get("name", "")
+        return f"{schema}.{name}".lower()
 
     @staticmethod
     def _normalize_column_names(columns):
+        if not columns:
+            return {}
         for col in columns.values():
-            col["name"] = col["name"].lower()
-        return {col["name"]: col for col in columns.values()}
+            if "name" in col:
+                col["name"] = col["name"].lower()
+        return {col["name"]: col for col in columns.values() if "name" in col}
 
     @staticmethod
     def _normalize_path(path: str) -> str:
@@ -425,7 +473,8 @@ class CoverageReport:
             coverage_str = f"{len(self.covered):5}/{len(self.total):<5}"
             if self.cov_type in (CoverageType.TEST, CoverageType.UNIT_TEST):
                 coverage_str = f"({self.hits} tests) {coverage_str}"
-            return f"| {self.entity_name:70} | {coverage_str} | {self.coverage * 100:5.1f}% |"
+            coverage_pct = self.coverage * 100 if self.coverage is not None else 0.0
+            return f"| {self.entity_name:70} | {coverage_str} | {coverage_pct:5.1f}% |"
         elif self.entity_type == CoverageReport.EntityType.CATALOG:
             buf = io.StringIO()
 
@@ -438,7 +487,8 @@ class CoverageReport:
             total_coverage = f"{len(self.covered):5}/{len(self.total):<5}"
             if self.cov_type in (CoverageType.TEST, CoverageType.UNIT_TEST):
                 total_coverage = f"({self.hits} tests) {total_coverage}"
-            buf.write(f"| {'Total':70} | {total_coverage} | {self.coverage * 100:5.1f}% |\n")
+            coverage_pct = self.coverage * 100 if self.coverage is not None else 0.0
+            buf.write(f"| {'Total':70} | {total_coverage} | {coverage_pct:5.1f}% |\n")
 
             return buf.getvalue()
         else:
@@ -452,7 +502,8 @@ class CoverageReport:
             coverage_str = f"{len(self.covered):5}/{len(self.total):<5}"
             if self.cov_type in (CoverageType.TEST, CoverageType.UNIT_TEST):
                 coverage_str = f"{f'({self.hits} tests)':>12} {coverage_str}"
-            return f"{self.entity_name:50} {coverage_str} {self.coverage * 100:5.1f}%"
+            coverage_pct = self.coverage * 100 if self.coverage is not None else 0.0
+            return f"{self.entity_name:50} {coverage_str} {coverage_pct:5.1f}%"
         elif self.entity_type == CoverageReport.EntityType.CATALOG:
             buf = io.StringIO()
 
@@ -468,7 +519,8 @@ class CoverageReport:
             total_coverage = f"{len(self.covered):5}/{len(self.total):<5}"
             if self.cov_type in (CoverageType.TEST, CoverageType.UNIT_TEST):
                 total_coverage = f"{f'({self.hits} tests)':>12} {total_coverage}"
-            buf.write(f"{'Total':50} {total_coverage} {self.coverage * 100:5.1f}%\n")
+            coverage_pct = self.coverage * 100 if self.coverage is not None else 0.0
+            buf.write(f"{'Total':50} {total_coverage} {coverage_pct:5.1f}%\n")
 
             return buf.getvalue()
         else:
@@ -628,7 +680,14 @@ class CoverageDiff:
                 if self.before is not None
                 else None
             )
-            after_entity = self.after.subentities[new_misses_entity_name]
+            # Safely access after_entity - it should exist but handle gracefully if not
+            after_entity = self.after.subentities.get(new_misses_entity_name)
+            if after_entity is None:
+                logging.warning(
+                    "Entity %s found in misses but not in subentities - skipping",
+                    new_misses_entity_name,
+                )
+                continue
             res[new_misses_entity_name] = CoverageDiff(before_entity, after_entity)
 
         return res
@@ -639,6 +698,11 @@ class CoverageDiff:
         if self.after.entity_type != CoverageReport.EntityType.CATALOG:
             raise TypeError(
                 f"Unsupported report_type for summary method: " f"{self.after.entity_type}"
+            )
+
+        if self.before is None:
+            raise ValueError(
+                "Cannot generate summary without a 'before' report to compare against"
             )
 
         before_cov = self.before.coverage if self.before.coverage is not None else 0.0
@@ -827,7 +891,12 @@ class CoverageDiff:
 
 
 def check_manifest_version(manifest_json):
-    manifest_version = manifest_json["metadata"]["dbt_schema_version"]
+    # Safely access metadata and schema version
+    metadata = manifest_json.get("metadata", {})
+    manifest_version = metadata.get("dbt_schema_version")
+    if not manifest_version:
+        logging.warning("Could not determine manifest schema version - skipping version check")
+        return
     if manifest_version not in SUPPORTED_MANIFEST_SCHEMA_VERSIONS:
         logging.warning(
             "Unsupported manifest.json version %s, unexpected behavior can occur. Supported "
@@ -854,7 +923,8 @@ def load_catalog(project_dir: Path, run_artifacts_dir: Path, manifest: Manifest)
     with open(catalog_path) as f:
         catalog_json = json.load(f)
 
-    catalog_nodes = {**catalog_json["sources"], **catalog_json["nodes"]}
+    # Safely access sources and nodes - they may not exist in all catalog.json files
+    catalog_nodes = {**catalog_json.get("sources", {}), **catalog_json.get("nodes", {})}
     # Filter out tables storing test failures: https://github.com/slidoapp/dbt-coverage/issues/62
     catalog_nodes = {n_id: n for n_id, n in catalog_nodes.items() if not n_id.startswith("test.")}
     catalog = Catalog.from_nodes(catalog_nodes.values(), manifest)
@@ -882,9 +952,10 @@ def load_manifest(project_dir: Path, run_artifacts_dir: Path) -> Manifest:
 
     check_manifest_version(manifest_json)
 
+    # Safely access sources and nodes - they should exist but handle gracefully
     manifest_nodes = {
-        **manifest_json["sources"],
-        **manifest_json["nodes"],
+        **manifest_json.get("sources", {}),
+        **manifest_json.get("nodes", {}),
         **manifest_json.get("unit_tests", {}),  # Only available from dbt 1.8
     }
     manifest = Manifest.from_nodes(manifest_nodes)
@@ -1081,17 +1152,41 @@ def compute(
 ):
     """Compute coverage for project in PROJECT_DIR from catalog.json and manifest.json."""
 
-    return do_compute(
-        project_dir,
-        run_artifacts_dir,
-        cov_report,
-        cov_type,
-        cov_fail_under,
-        cov_fail_compare,
-        model_path_filter,
-        model_path_exclusion_filter,
-        output_format,
-    )
+    try:
+        return do_compute(
+            project_dir,
+            run_artifacts_dir,
+            cov_report,
+            cov_type,
+            cov_fail_under,
+            cov_fail_compare,
+            model_path_filter,
+            model_path_exclusion_filter,
+            output_format,
+        )
+    except (FileNotFoundError, ValueError, RuntimeError) as e:
+        # Format errors nicely without including large JSON objects in traceback
+        error_msg = str(e)
+        if not error_msg:
+            error_msg = f"{type(e).__name__}: {repr(e)}"
+        typer.echo(f"Error: {error_msg}", err=True)
+        # In verbose mode, let the exception propagate for full traceback
+        if logging.getLogger().level <= logging.INFO:
+            raise
+        raise typer.Exit(1) from None
+    except Exception as e:
+        # For unexpected errors, provide a concise message
+        error_type = type(e).__name__
+        error_msg = str(e)
+        if len(error_msg) > 500:
+            # Truncate very long error messages that might contain JSON
+            error_msg = error_msg[:500] + "... (truncated)"
+        typer.echo(f"Unexpected error ({error_type}): {error_msg}", err=True)
+        typer.echo("Run with --verbose for more details.", err=True)
+        # In verbose mode, let the exception propagate for full traceback
+        if logging.getLogger().level <= logging.INFO:
+            raise
+        raise typer.Exit(1) from None
 
 
 @app.command()
@@ -1107,7 +1202,31 @@ def compare(
 ):
     """Compare two coverage reports generated by the compute command."""
 
-    return do_compare(report, compare_report, output_format)
+    try:
+        return do_compare(report, compare_report, output_format)
+    except (FileNotFoundError, ValueError, RuntimeError) as e:
+        # Format errors nicely without including large JSON objects in traceback
+        error_msg = str(e)
+        if not error_msg:
+            error_msg = f"{type(e).__name__}: {repr(e)}"
+        typer.echo(f"Error: {error_msg}", err=True)
+        # In verbose mode, let the exception propagate for full traceback
+        if logging.getLogger().level <= logging.INFO:
+            raise
+        raise typer.Exit(1) from None
+    except Exception as e:
+        # For unexpected errors, provide a concise message
+        error_type = type(e).__name__
+        error_msg = str(e)
+        if len(error_msg) > 500:
+            # Truncate very long error messages that might contain JSON
+            error_msg = error_msg[:500] + "... (truncated)"
+        typer.echo(f"Unexpected error ({error_type}): {error_msg}", err=True)
+        typer.echo("Run with --verbose for more details.", err=True)
+        # In verbose mode, let the exception propagate for full traceback
+        if logging.getLogger().level <= logging.INFO:
+            raise
+        raise typer.Exit(1) from None
 
 
 @app.callback()

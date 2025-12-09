@@ -31,10 +31,11 @@ black = {version = "==24.2.0", python = ">=3.8"}  # Use the same version as in .
 isort = {version = "==5.13.2", python = ">=3.8"}  # Use the same version as in .pre-commit-config.yaml
 pre-commit = {version = "^3.6.2", python = ">=3.9"}
 
-tox = { version = "^4", python = "^3.7" }
+tox = { version = ">=4.15.0", python = "^3.8" }  # >=4.15.0 required for compatibility with packaging 24.0+
 tomli = { version = "*", python = "^3.7" }  # Needed for a successful resolution of tox's transitive dependencies
 typing-extensions = { version = "*", python = "^3.7" }  # Needed for a successful resolution of tox's transitive dependencies
 colorama = { version = "*", python = "^3.7" }  # Needed for a successful resolution of tox's transitive dependencies
+packaging = { version = ">=25.0", python = "^3.8" }  # Required for tox >=4.15.0 compatibility
 
 # Needed for running tests locally
 [tool.poetry.group.test.dependencies]
