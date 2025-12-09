@@ -144,26 +144,96 @@ class Catalog:
             New ``Catalog`` instance containing only ``Table``s that passed the filter.
         """
 
+        initial_table_count = len(self.tables)
+        logging.debug("DEBUG: Starting filter_tables with %d initial tables", initial_table_count)
+
+        # Show sample paths before filtering
+        if initial_table_count > 0:
+            sample_paths = list(self.tables.values())[:5]
+            logging.debug(
+                "DEBUG: Sample original_file_path values before filtering (showing first 5):"
+            )
+            for table in sample_paths:
+                logging.debug("  - %s: %s", table.name, table.original_file_path)
+            if initial_table_count > 5:
+                logging.debug("  ... and %d more tables", initial_table_count - 5)
+
         tables = self.tables.copy()
 
         if model_path_filter is not None:
             model_path_filter = tuple(model_path_filter)
+            logging.debug("DEBUG: Applying model_path_filter: %s", model_path_filter)
+            tables_before_inclusion = len(tables)
+            matched_tables = []
+            unmatched_tables = []
+
+            for t_id, t in tables.items():
+                if t.original_file_path.startswith(model_path_filter):
+                    matched_tables.append((t_id, t.name, t.original_file_path))
+                else:
+                    unmatched_tables.append((t_id, t.name, t.original_file_path))
+
             tables = {
                 t_id: t
                 for t_id, t in tables.items()
                 if t.original_file_path.startswith(model_path_filter)
             }
 
+            logging.debug(
+                "DEBUG: Inclusion filter matched %d tables, excluded %d tables",
+                len(matched_tables),
+                len(unmatched_tables),
+            )
+            if matched_tables:
+                logging.debug("DEBUG: Matched tables (showing first 10):")
+                for t_id, t_name, t_path in matched_tables[:10]:
+                    logging.debug("  - %s (%s): %s", t_name, t_id, t_path)
+                if len(matched_tables) > 10:
+                    logging.debug("  ... and %d more matched tables", len(matched_tables) - 10)
+            if unmatched_tables:
+                logging.debug("DEBUG: Unmatched tables (showing first 10):")
+                for t_id, t_name, t_path in unmatched_tables[:10]:
+                    logging.debug("  - %s (%s): %s", t_name, t_id, t_path)
+                if len(unmatched_tables) > 10:
+                    logging.debug("  ... and %d more unmatched tables", len(unmatched_tables) - 10)
+
         if model_path_exclusion_filter is not None:
             model_path_exclusion_filter = tuple(model_path_exclusion_filter)
+            logging.debug(
+                "DEBUG: Applying model_path_exclusion_filter: %s", model_path_exclusion_filter
+            )
+            tables_before_exclusion = len(tables)
+            excluded_tables = []
+            kept_tables = []
+
+            for t_id, t in tables.items():
+                if t.original_file_path.startswith(model_path_exclusion_filter):
+                    excluded_tables.append((t_id, t.name, t.original_file_path))
+                else:
+                    kept_tables.append((t_id, t.name, t.original_file_path))
+
             tables = {
                 t_id: t
                 for t_id, t in tables.items()
                 if not t.original_file_path.startswith(model_path_exclusion_filter)
             }
 
+            logging.debug(
+                "DEBUG: Exclusion filter excluded %d tables, kept %d tables",
+                len(excluded_tables),
+                len(kept_tables),
+            )
+            if excluded_tables:
+                logging.debug("DEBUG: Excluded tables (showing first 10):")
+                for t_id, t_name, t_path in excluded_tables[:10]:
+                    logging.debug("  - %s (%s): %s", t_name, t_id, t_path)
+                if len(excluded_tables) > 10:
+                    logging.debug("  ... and %d more excluded tables", len(excluded_tables) - 10)
+
         logging.info(
-            "Successfully filtered tables. Total tables post-filtering: %d tables", len(tables)
+            "Successfully filtered tables. Total tables post-filtering: %d tables (started with %d)",
+            len(tables),
+            initial_table_count,
         )
 
         return Catalog(tables=tables)
@@ -1054,6 +1124,39 @@ def fail_compare(coverage_report: CoverageReport, compare_path: Path):
         )
 
 
+def normalize_path_filter(filter_value: Optional[List[str]]) -> Optional[List[str]]:
+    """
+    Normalizes a path filter to handle comma-separated strings.
+
+    Typer's List[str] option expects multiple values, but users may pass
+    a comma-separated string. This function handles both cases:
+    - If filter_value is None, returns None
+    - If filter_value is a list with a single comma-separated string, splits it
+    - If filter_value is already a proper list, returns it as-is
+
+    Args:
+        filter_value: Optional list of strings, potentially containing comma-separated values
+
+    Returns:
+        Normalized list of strings, or None if input was None
+    """
+    if filter_value is None:
+        return None
+
+    # If we have a single element that contains commas, split it
+    if len(filter_value) == 1 and "," in filter_value[0]:
+        logging.debug(
+            "DEBUG: Detected comma-separated string in filter, splitting: %s", filter_value[0]
+        )
+        # Split by comma and strip whitespace from each element
+        normalized = [item.strip() for item in filter_value[0].split(",") if item.strip()]
+        logging.debug("DEBUG: Normalized filter to %d paths: %s", len(normalized), normalized)
+        return normalized
+
+    # Otherwise, return as-is (already a proper list)
+    return filter_value
+
+
 def do_compute(
     project_dir: Path = Path("."),
     run_artifacts_dir: Path = None,
@@ -1072,13 +1175,33 @@ def do_compute(
     """
 
     catalog = load_files(project_dir, run_artifacts_dir)
+    initial_table_count = len(catalog.tables)
+    logging.debug("DEBUG: Loaded catalog with %d tables before filtering", initial_table_count)
+
+    # Normalize filters to handle comma-separated strings
+    model_path_filter = normalize_path_filter(model_path_filter)
+    model_path_exclusion_filter = normalize_path_filter(model_path_exclusion_filter)
+
     if model_path_filter or model_path_exclusion_filter:
+        logging.debug(
+            "DEBUG: About to apply filters - model_path_filter=%s, model_path_exclusion_filter=%s",
+            model_path_filter,
+            model_path_exclusion_filter,
+        )
         catalog = catalog.filter_tables(model_path_filter, model_path_exclusion_filter)
+        logging.debug("DEBUG: After filtering, catalog contains %d tables", len(catalog.tables))
         if not catalog.tables:
-            raise ValueError(
-                "After filtering, the Catalog contains no tables. Ensure your model_path_filter "
-                "is correct."
+            # Provide more detailed error message with debug info
+            error_msg = (
+                "After filtering, the Catalog contains no tables. "
+                f"Started with {initial_table_count} tables. "
             )
+            if model_path_filter:
+                error_msg += f"model_path_filter={model_path_filter}. "
+            if model_path_exclusion_filter:
+                error_msg += f"model_path_exclusion_filter={model_path_exclusion_filter}. "
+            error_msg += "Ensure your filter paths are correct. Run with --verbose to see detailed debug output."
+            raise ValueError(error_msg)
 
     coverage_report = compute_coverage(catalog, cov_type)
 
